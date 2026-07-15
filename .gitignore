@@ -1,6 +1,10 @@
-
 __pycache__/
 
 *.pyc
+
+# model weights (원본 & fine-tuned) — GitHub에 올리지 않음
 *.bin
-config.json
+*.safetensors
+
+# fine-tuning 출력 폴더 (모델 + 체크포인트)
+bert-tiny-sst2/
