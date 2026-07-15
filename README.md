@@ -6,6 +6,7 @@ BERT-Tiny 모델을 **FPGA에 INT8 가속기로 구현**하는 프로젝트.
 - **Target Model**: HuggingFace [`prajjwal1/bert-tiny`](https://huggingface.co/prajjwal1/bert-tiny) (L=2, H=128, A=2, ≈4.4M params)
 - **Target Task**: SST-2 감성분석 (단일 문장, 2-class classification)
 - **Precision**: INT8 quantization
+- **Target Board**: AMD Xilinx Kria KV260 (Zynq UltraScale+ MPSoC)
 - **Acceleration Scope**: Embedding + Encoder ×2 + Pooler + Classifier(128→2).
 
 ---
@@ -29,33 +30,6 @@ BERT-Tiny 모델을 **FPGA에 INT8 가속기로 구현**하는 프로젝트.
 |------|------|
 | [`docs/bert_tiny_description.md`](docs/bert_tiny_description.md) | 모델 구조 상세 — hyperparameter, 텐서별 param, dataflow, 연산량/메모리, 비선형 연산, INT8·가속기 설계 시사점 |
 | [`docs/finetune.md`](docs/finetune.md) | fine-tuning 과정 — 라이브러리, 파이프라인, 하이퍼파라미터, FP32 baseline |
-
----
-
-## 빠른 시작
-
-### 환경
-
-| 라이브러리 | 최소 버전 |
-|------------|-----------|
-| torch | ≥ 2.0 |
-| transformers | ≥ 4.46 |
-| datasets | ≥ 2.19 |
-| accelerate | ≥ 1.1.0 |
-| numpy | ≥ 1.24 |
-
-```powershell
-pip install torch transformers datasets accelerate
-```
-
-### Fine-tuning 실행
-
-```powershell
-python python/finetune_sst2.py
-```
-
-- SST-2로 학습 후 `python/bert-tiny-sst2/`에 모델 저장, validation accuracy 출력.
-- CPU 기준 ~20–30분.
 
 ---
 
