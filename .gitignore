@@ -8,3 +8,11 @@ __pycache__/
 
 # fine-tuning 출력 폴더 (모델 + 체크포인트)
 bert-tiny-sst2/
+
+references/
+
+*.log
+*.jou
+*.tcl
+
+*old/

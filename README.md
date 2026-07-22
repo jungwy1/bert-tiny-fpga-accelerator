@@ -18,7 +18,8 @@ BERT-Tiny 모델을 **FPGA에 INT8 가속기로 구현**하는 프로젝트.
 | 모델 구조 분석 (architecture, param, dataflow) | ✅ 완료 | [`docs/bert_tiny_description.md`](docs/bert_tiny_description.md) |
 | 타깃 태스크 확정 | ✅ 완료 | SST-2 (단일 문장, 2-class)  |
 | SST-2 fine-tuning → FP32 baseline | ✅ 완료 | **validation accuracy = 0.8142** |
-| INT8 양자화 (PTQ) | ⬜ 예정 | FP32 대비 accuracy 유지율 측정 |
+| INT8 양자화 — Phase 1 (weight-only) | ✅ 완료 | 손실 ~0 (per-channel 0.8131) |
+| INT8 양자화 — Phase 2 (activation) | ⬜ 예정 | calibration → full INT8 정확도 |
 | 가속기 설계 (GEMM engine, 비선형 유닛) | ⬜ 예정 | |
 | FPGA 매핑 & 검증 | ⬜ 예정 | weight/scale HW 반영 |
 
@@ -30,6 +31,8 @@ BERT-Tiny 모델을 **FPGA에 INT8 가속기로 구현**하는 프로젝트.
 |------|------|
 | [`docs/bert_tiny_description.md`](docs/bert_tiny_description.md) | 모델 구조 상세 — hyperparameter, 텐서별 param, dataflow, 연산량/메모리, 비선형 연산, INT8·가속기 설계 시사점 |
 | [`docs/finetune.md`](docs/finetune.md) | fine-tuning 과정 — 라이브러리, 파이프라인, 하이퍼파라미터, FP32 baseline |
+| [`docs/quantization.md`](docs/quantization.md) | INT8 양자화 — 스킴, phased PTQ, Phase 1 결과 |
+| [`docs/int_datapath.md`](docs/int_datapath.md) | INT8 데이터패스 명세 — 각 단계가 쓰는 파라미터, requant/align 규칙, 비트폭 |
 
 ---
 
