@@ -1,24 +1,29 @@
+# ==================== Python ====================
 __pycache__/
-
 *.pyc
-
-# model weights (원본 & fine-tuned) — GitHub에 올리지 않음
+*.pt
 *.bin
 *.safetensors
-
-# fine-tuning 출력 폴더 (모델 + 체크포인트)
 bert-tiny-sst2/
 
+# ==================== Verilog ====================
+Verilog/sim/*
+!Verilog/sim/tb_*.sv
+/Verilog/syn/
+
+
 references/
+BERT_vivado/
+draw.io/
+*old/
+/rtl/
+xsim.dir/
+
 
 *.log
 *.jou
 *.tcl
-
-*old/
-
-draw.io/
-
-BERT_vivado/
-
-rtl/
+*.pb
+*.wdb
+*.vcd
+*.rpt
