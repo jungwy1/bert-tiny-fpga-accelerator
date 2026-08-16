@@ -1,0 +1,10 @@
+# Vivado / xsim build artifacts
+sim/xsim.dir/
+sim/*.wdb
+sim/*.vcd
+sim/*.log
+sim/*.pb
+sim/*.jou
+sim/.Xil/
+sim/xsim_*.backup.*
+*.str

@@ -16,3 +16,9 @@ references/
 *.tcl
 
 *old/
+
+draw.io/
+
+BERT_vivado/
+
+rtl/

@@ -13,11 +13,17 @@ from transformers import (
     BertForSequenceClassification,
     TrainingArguments,
     Trainer,
+    set_seed,
 )
 
 MODEL = "prajjwal1/bert-tiny"
 MAX_LEN = 64          # SST-2 sentences are short. Upper bound on S (ties to FPGA sequence length).
 OUT_DIR = "./bert-tiny-sst2"
+SEED = 42             # fixed for reproducibility (head init, data shuffle, dropout)
+
+# Seed everything (python/numpy/torch, CPU+CUDA) BEFORE the model is built so the
+# random classifier head initializes deterministically.
+set_seed(SEED)
 
 # 1) Load data ------------------------------------------------------------
 # SST-2: train ~67k, validation 872. label 0=negative, 1=positive
@@ -60,6 +66,8 @@ args = TrainingArguments(
     logging_steps=100,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
+    seed=SEED,            # Trainer RNG: data shuffle order, dropout
+    data_seed=SEED,       # data sampler seed (pinned separately from `seed`)
 )
 
 trainer = Trainer(

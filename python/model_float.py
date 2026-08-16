@@ -4,7 +4,7 @@ import torch.nn as nn
 from transformers import BertForSequenceClassification, BertTokenizerFast
 
 def _no_tap(name, x):
-    """Default tap: identity — the model behaves exactly as before.
+    """Default tap: identity -- the model behaves exactly as before.
     Pass a real `tap(name, tensor)` (see export_params.py) to observe the
     activation at every quantization point without changing the math."""
     return x
@@ -15,7 +15,7 @@ def layer_norm(x, weight, bias, eps=1e-12):
     Kept as explicit math (not nn.LayerNorm) so it can be hardened to
     fixed-point in the integer golden model later."""
     mu  = x.mean(-1, keepdim=True)
-    var = x.var(-1, unbiased=False, keepdim=True)   # unbiased=False = /N (BERT 방식)
+    var = x.var(-1, unbiased=False, keepdim=True)   # unbiased=False -> divide by N (BERT convention)
     x_hat = (x - mu) / torch.sqrt(var + eps)
     return x_hat * weight + bias
 
@@ -23,7 +23,7 @@ class Embeddings(nn.Module):
     def __init__(self, sd, eps=1e-12, tap=None):
         super().__init__()
         self.tap = tap or _no_tap
-        # fine-tuned weight load
+        # load fine-tuned weights
         self.word = sd["bert.embeddings.word_embeddings.weight"]        # [30522,128]
         self.pos  = sd["bert.embeddings.position_embeddings.weight"]    # [512,128]
         self.type = sd["bert.embeddings.token_type_embeddings.weight"]  # [2,128]
@@ -73,16 +73,16 @@ class EncoderLayer(nn.Module):
         Q = t(f"L{L}.q", linear(x, self.Wq, self.bq))
         K = t(f"L{L}.k", linear(x, self.Wk, self.bk))
         V = t(f"L{L}.v", linear(x, self.Wv, self.bv))
-        # head [H, S, d]
+        # per head [H, S, d]
         Q = Q.view(S, H, d).transpose(0,1)
         K = K.view(S, H, d).transpose(0,1)
         V = V.view(S, H, d).transpose(0,1)
-        # attetion socres = QK_T * scaling  [H, S, S]
+        # attention scores = QK^T * scaling  [H, S, S]
         scaling = 1.0 / (d ** 0.5)
-        scores = t(f"L{L}.scores", (Q @ K.transpose(-1,-2)) * scaling) # K.t = [S, d, H]
+        scores = t(f"L{L}.scores", (Q @ K.transpose(-1,-2)) * scaling)   # K^T: [H, d, S]
         # softmax
         P = t(f"L{L}.probs", torch.softmax(scores, dim=-1))
-        # context = PV [H, S, d] & concat (-> [S,H,d] -> [S,128])
+        # context = PV [H, S, d], then concat  ([H,S,d] -> [S,H,d] -> [S,128])
         ctx = t(f"L{L}.ctx", (P @ V).transpose(0,1).reshape(S, H * d))
         # output projection
         return t(f"L{L}.attn_out", linear(ctx, self.Wo, self.bo))
@@ -104,7 +104,7 @@ class Pooler(nn.Module):
         self.tap = tap or _no_tap
         self.Wp = sd["bert.pooler.dense.weight"]; self.bp = sd["bert.pooler.dense.bias"]
     def forward(self, x):                     # x: [S,128]
-        cls = self.tap("pool_in", x[0])                                  # [CLS] = 0번 토큰 [128]
+        cls = self.tap("pool_in", x[0])                                  # [CLS] = token 0, [128]
         h = self.tap("pool_mid", linear(cls, self.Wp, self.bp))          # pre-tanh (cf. ffn_mid)
         return self.tap("pool_out", torch.tanh(h))                       # [128]
 
@@ -122,7 +122,7 @@ class GoldenBertTiny(nn.Module):
             x = layer(x)
         pooled = self.pooler(x)
         return self.tap("logits", linear(pooled, self.Wc, self.bc))   # logits [2]
- 
+
 
 if __name__ == "__main__":
     hf  = BertForSequenceClassification.from_pretrained("./bert-tiny-sst2").eval()
@@ -134,42 +134,39 @@ if __name__ == "__main__":
     print("===========================Embedding==========================")
     emb = Embeddings(sd)
     with torch.no_grad():
-        my_emb   = emb(ids[0])                    # 우리: [S,128]
+        my_emb = emb(ids[0])                    # ours: [S,128]
         hf_emb = hf.bert.embeddings(ids)[0]     # HF:   [S,128]
     print(f"my_emb: {my_emb.shape}")
     print(f"hf_emb: {hf_emb.shape}")
-    print("emb diff:", (my_emb - hf_emb).abs().max().item())   # 1e-5 이하면 OK
+    print("emb diff:", (my_emb - hf_emb).abs().max().item())   # OK if < 1e-5
 
     print("===========================Encoder==========================")
     layer0 = EncoderLayer(sd, 0)
     with torch.no_grad():
-        x = my_emb                                  # embedding 출력
+        x = my_emb                                  # embedding output
         my_enc = layer0(x)
         hf_enc = hf.bert.encoder.layer[0](x.unsqueeze(0))[0]
     print(f"my_enc: {my_enc.shape}")
     print(f"hf_enc: {hf_enc.shape}")
-    print("layer0 diff:", (my_enc - hf_enc).abs().max().item())   # 1e-5 이하면 OK
+    print("layer0 diff:", (my_enc - hf_enc).abs().max().item())   # OK if < 1e-5
 
     print("===========================Logits==========================")
     model = GoldenBertTiny(sd)
     with torch.no_grad():
-        my_logits = model(ids[0])                      # [2]
+        my_logits = model(ids[0])                 # [2]
         hf_logits = hf(ids).logits[0]             # [2]
     print(f"my_logits: {my_logits}\n{my_logits.shape}")
     print(f"hf_logits: {hf_logits.shape}")
-    print("logits diff:", (my_logits - hf_logits).abs().max().item())   # 1e-4 이하면 OK
+    print("logits diff:", (my_logits - hf_logits).abs().max().item())   # OK if < 1e-4
 
-    # print("===========================Validation==========================")
-    # from datasets import load_dataset
+    print("===========================Validation==========================")
+    from datasets import load_dataset
 
-    # val = load_dataset("stanfordnlp/sst2")["validation"]
-    # correct = 0
-    # with torch.no_grad():
-    #     for ex in val:
-    #         ids = tok(ex["sentence"], return_tensors="pt", truncation=True, max_length=64)["input_ids"]
-    #         pred = model(ids[0]).argmax().item()
-    #         correct += (pred == ex["label"])
-    # print("golden acc:", correct / len(val))      # 0.8142 나오면 Stage A 완료!
-
-
-    
+    val = load_dataset("stanfordnlp/sst2")["validation"]
+    correct = 0
+    with torch.no_grad():
+        for ex in val:
+            ids = tok(ex["sentence"], return_tensors="pt", truncation=True, max_length=64)["input_ids"]
+            pred = model(ids[0]).argmax().item()
+            correct += (pred == ex["label"])
+    print("golden acc:", correct / len(val))      # expect 0.8142 -> Stage A done

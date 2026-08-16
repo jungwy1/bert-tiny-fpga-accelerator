@@ -3,13 +3,14 @@ Calibrate the float reference model and export all integer parameters.
 
 Scheme (symmetric everywhere -- no zero-points, matching int_ops.py and
 I-BERT / SwiftTron / FQ-BERT):
-  activations : INT8  symmetric per-tensor   S = max|x| / 127
-  weights     : INT8  symmetric per-tensor   S = max|W| / 127
+  activations : INT8  symmetric per-tensor   S = max|x| / 127   (A8)
+  matmul wgt  : INT4  symmetric per-tensor   S = max|W| / 7      (W4, per quant_sweep.md)
   LayerNorm   : gamma INT8, beta INT32 (both symmetric per-tensor)
+  embeddings  : INT8  (lookup tables, handled in PS)
   bias        : INT32 symmetric, in the accumulator domain  S = S_in * S_w
 
 Special case: `L{i}.probs` (softmax output) has a mathematically known range
-[0, 1], so its scale is FIXED at 1/255 (unsigned 8-bit) rather than calibrated.
+[0, 1], so its scale is FIXED at 1/127 (signed 8-bit, 0..127) rather than calibrated.
 
 Run (from python/):  python export_params.py
 Output: quant_params.pt
@@ -23,14 +24,15 @@ from data import (load_state_dict, load_tokenizer, load_sst2,
                   run_calibration, CALIB_SAMPLES)
 
 OUT_PATH = "quant_params.pt"
-W_QMAX = 127                      # INT8 symmetric
+A_QMAX = 127                      # INT8 symmetric (activations, embeddings)
+WGT_QMAX = 7                      # INT4 symmetric (matmul weights -- A8W4)
 B_QMAX = 2 ** 31 - 1              # INT32 symmetric (bias, LayerNorm beta)
 G_QMAX = 127                      # INT8 symmetric (LayerNorm gamma)
 
 # Activations whose range is known a priori, so their scale is FIXED rather than
 # calibrated -- and the requantization fuses into the op's final division.
 FIXED_ACT_SCALES = {
-    "probs":    1.0 / 255,      # softmax output in [0, 1]  (unsigned 8-bit)
+    "probs":    1.0 / 127,      # softmax output in [0, 1]  (signed 8-bit, 0..127)
     "pool_out": 1.0 / 127,      # tanh output in [-1, 1]    (signed 8-bit)
 }
 
@@ -44,7 +46,7 @@ class Observer:
     def observe(self, x):
         self.absmax = max(self.absmax, x.detach().abs().max().item())
 
-    def scale(self, qmax=W_QMAX):
+    def scale(self, qmax=A_QMAX):
         return max(self.absmax / qmax, 1e-12)     # guard against an all-zero tensor
 
 
@@ -124,32 +126,32 @@ def main():
                          "source": "calibrated"}
 
     # 2) matmul weights + INT32 bias (bias lives in the accumulator domain S_in*S_w)
-    ops = {}
+    weights = {}
     for name, prefix, a_in, a_out in matmul_ops():
         W = sd[prefix + ".weight"]
         b = sd[prefix + ".bias"]
-        q_w, s_w = quant_sym(W, W_QMAX)
+        q_w, s_w = quant_sym(W, WGT_QMAX)                 # INT4 weight (A8W4)
         s_a = act[a_in]["scale"]
         s_acc = s_a * s_w                                 # accumulator scale
         q_b = torch.round(b.double() / s_acc).clamp(-B_QMAX, B_QMAX).to(torch.int64)
-        ops[name] = {"w_int8": q_w.to(torch.int8), "w_scale": s_w,
-                     "bias_int32": q_b.to(torch.int32), "bias_scale": s_acc,
-                     "in": a_in, "out": a_out}
+        weights[name] = {"w_int4": q_w.to(torch.int8), "w_scale": s_w,   # int8 dtype, values [-7,7]
+                         "bias_int32": q_b.to(torch.int32), "bias_scale": s_acc,
+                         "in": a_in, "out": a_out}
 
     # 3) LayerNorm gamma (INT8) / beta (INT32)
     for name, prefix, a_in, a_out in layernorm_params():
         q_g, s_g = quant_sym(sd[prefix + ".weight"], G_QMAX)
         q_b, s_b = quant_sym(sd[prefix + ".bias"], B_QMAX)
-        ops[name] = {"gamma_int8": q_g.to(torch.int8), "gamma_scale": s_g,
-                     "beta_int32": q_b.to(torch.int32), "beta_scale": s_b,
-                     "in": a_in, "out": a_out}
+        weights[name] = {"gamma_int8": q_g.to(torch.int8), "gamma_scale": s_g,
+                         "beta_int32": q_b.to(torch.int32), "beta_scale": s_b,
+                         "in": a_in, "out": a_out}
 
-    # 4) embedding tables (INT8 lookup)
+    # 4) embedding tables (INT8 lookup -- handled in PS)
     for name, key in EMBED_TABLES:
-        q_t, s_t = quant_sym(sd[key], W_QMAX)
-        ops[name] = {"table_int8": q_t.to(torch.int8), "scale": s_t, "out": "emb_out"}
+        q_t, s_t = quant_sym(sd[key], A_QMAX)
+        weights[name] = {"table_int8": q_t.to(torch.int8), "scale": s_t, "out": "emb_out"}
 
-    torch.save({"act": act, "op": ops}, OUT_PATH)
+    torch.save({"act": act, "weight": weights}, OUT_PATH)
 
     # ------------------------------------------------------------- report
     print(f"calibration: {CALIB_SAMPLES} sentences\n")
@@ -157,7 +159,7 @@ def main():
     for n, d in act.items():
         used = math.ceil(math.log2(d["observed_absmax"] / d["scale"] + 1)) if d["observed_absmax"] else 0
         print(f"{n:16s} {d['scale']:12.3e} {d['observed_absmax']:10.3f}  {used:>10d}  {d['source']}")
-    print(f"\nexported {len(act)} activations + {len(ops)} ops -> {OUT_PATH}")
+    print(f"\nexported {len(act)} activations + {len(weights)} weights -> {OUT_PATH}")
 
 
 if __name__ == "__main__":
