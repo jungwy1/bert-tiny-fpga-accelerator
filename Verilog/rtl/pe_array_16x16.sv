@@ -20,6 +20,7 @@ module pe_array_16x16 (
     input  logic               en,            // broadcast: accumulate/shift enable (hold=0)
     input  logic               drain,         // broadcast: SHIFT mode (cascade readout)
     input  logic               pack2,         // broadcast: 1=INT8xINT4 x2, 0=INT8xINT8
+    input  logic               hold,
     input  logic signed [7:0]  act_row  [16], // one activation per ROW  (col-broadcast)
     input  logic signed [7:0]  w_col    [16], // one weight per COLUMN   (row-broadcast)
     input  logic signed [47:0] bias_col [16], // one packed bias per COLUMN (C port)
@@ -39,6 +40,7 @@ module pe_array_16x16 (
                     .drain (drain),
                     .init  (init),
                     .en    (en),
+                    .hold  (hold),
                     .pack2 (pack2),
                     .act   (act_row[r]),                    // shared along the row
                     .w     (w_col[c]),                      // shared down the column

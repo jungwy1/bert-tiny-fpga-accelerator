@@ -37,10 +37,11 @@
 | scratch b2 | BRAM ×2 | 512 × 128 | V → H |
 | scratch b3 | BRAM ×2 | 512 × 128 | P → H |
 | bias | BRAM ×3 (직렬) | 1536 × 64 (2 INT32/word) | GEMM per-channel bias |
+| ln_param | BRAM ×1 | 512 × 72 (40 used) | LN γ(INT8)+β(INT32), 4 LN × 128 |
 | V transpose | reg-array (FF) | 16×16 INT8 ×2 | corner-turn (ping-pong) |
 | INT32 결과 | — | 버퍼 없음 | VFU 직통 |
 
-합계: **URAM 6 / BRAM 13** (+ transpose reg-array). VFU 내부 버퍼(LN γ/β 등)는 별도.
+합계: **URAM 6 / BRAM 14** (+ transpose reg-array). LN 2-pass 버퍼 등 VFU 내부는 별도.
 
 ---
 
@@ -112,6 +113,32 @@ read word c = {bias_b, bias_a}  →  C = (bias_b<<20) + bias_a  →  bias_col[c]
 ```
 - tile당 16 read(column쌍 1개씩) → 16×48b `bias_col` 레지스터 → init에서 C포트.
 - **이전 tile drain 중 preload** → critical path 밖 (depth 3-stack의 ~2 cycle latency 완전 흡수).
+
+---
+
+## 4b. ln_param (BRAM, LN γ/β)
+
+LayerNorm affine `y = γ·(x−μ)/σ + β`. **VFU**가 Res+Norm 때 읽음. encoder-only 스코프라 LN 4개
+(layer당 2개: post-attn / post-FFN × 2 layer). embedding LN은 host.
+
+- **γ+β를 한 word에 pack**: word = **γ(INT8) + β(INT32) = 40-bit** (72 중 40 사용).
+- word 수 = **4 LN × 128 feature = 512** = BRAM36 SDP 깊이(512) **딱 맞음** → **BRAM ×1**.
+
+### 배치
+```
+word layout:  [39:32] = γ (INT8)   [31:0] = β (INT32)
+addr        =  ln_id·128 + feature       (ln_id 0..3, feature 0..127)
+```
+| ln_id | LN | addr 범위 |
+|-------|----|-----------|
+| 0 | L0 post-attn | 0 – 127 |
+| 1 | L0 post-FFN | 128 – 255 |
+| 2 | L1 post-attn | 256 – 383 |
+| 3 | L1 post-FFN | 384 – 511 |
+
+- **1 read = γ,β 동시** (VFU feature당 1접근). command `ln_base = ln_id·128`.
+- γ INT8 민감하면 폭 조정(β↓/γ INT16) — 40→여전히 72 안이라 여유.
+- (γ/β 실제 폭·스케일은 quant sweep / VFU 구현 기준으로 최종 확정.)
 
 ---
 

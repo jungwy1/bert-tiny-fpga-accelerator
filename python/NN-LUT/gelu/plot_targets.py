@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-QP_PATH = "../quant_params.pt"
+QP_PATH = "../../quant_params.pt"
 
 
 def gelu(u):

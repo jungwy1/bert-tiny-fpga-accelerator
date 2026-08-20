@@ -10,7 +10,7 @@
 //   pack2=0 : acc0 = bias   + sum w*A,   acc1 = 0
 module tb_pe_array;
 
-    logic               clk = 0, rst, init, en, drain, pack2;
+    logic               clk = 0, rst, init, en, drain, pack2, hold;
     logic signed [7:0]  act_row  [16];
     logic signed [7:0]  w_col    [16];
     logic signed [47:0] bias_col [16];
@@ -18,7 +18,7 @@ module tb_pe_array;
 
     int errors = 0;
 
-    pe_array_16x16 dut (.clk, .rst, .init, .en, .drain, .pack2,
+    pe_array_16x16 dut (.clk, .rst, .init, .en, .drain, .pack2, .hold,
                         .act_row, .w_col, .bias_col, .p_drain);
 
     always #5 clk = ~clk;
@@ -38,13 +38,13 @@ module tb_pe_array;
     endtask
 
     task automatic do_reset;
-        rst = 1; init = 0; en = 0; drain = 0; pack2 = 0;
+        rst = 1; init = 0; en = 0; drain = 0; pack2 = 0; hold = 0;
         for (int i = 0; i < 16; i++) begin act_row[i]=0; w_col[i]=0; bias_col[i]=0; end
         @(posedge clk); @(posedge clk); #1;
         rst = 0; @(posedge clk); #1;
     endtask
 
-    task automatic run_tile(int K, logic p2, string name);
+    task automatic run_tile(int K, logic p2, logic hd, string name);
         int e_before = errors;
 
         // --- random data + golden ---
@@ -83,11 +83,27 @@ module tb_pe_array;
         for (int c = 0; c < 16; c++) w_col[c] = 0;
         step(0, 1, 0); step(0, 1, 0);
 
-        // --- drain 16 cycles: p_drain = col 15,14,...,0 ---
-        for (int d = 0; d < 16; d++) begin
-            step(0, 1, 1);
-            for (int r = 0; r < 16; r++) cap[r][15 - d] = p_drain[r];
+        // --- drain 16 cols (col 15..0), optionally injecting random holds (hd) ---
+        // hold cycle: array frozen -> p_drain must stay put; capture only on non-hold.
+        hold = 0;
+        for (int d = 0; d < 16; ) begin
+            if (hd && d > 0 && ($urandom % 2)) begin
+                hold = 1;
+                step(0, 1, 1);
+                for (int r = 0; r < 16; r++)
+                    if (p_drain[r] !== cap[r][15-(d-1)]) begin
+                        errors++;
+                        if (errors - e_before <= 6)
+                            $display("  [MISS] hold not frozen r%0d @d%0d", r, d);
+                    end
+            end else begin
+                hold = 0;
+                step(0, 1, 1);
+                for (int r = 0; r < 16; r++) cap[r][15 - d] = p_drain[r];
+                d++;
+            end
         end
+        hold = 0;
 
         // --- unpack + compare ---
         for (int r = 0; r < 16; r++)
@@ -113,9 +129,12 @@ module tb_pe_array;
 
     initial begin
         #100;                              // glbl GSR
-        do_reset; run_tile(16, 1'b1, "pack2 tile");
-        do_reset; run_tile(16, 1'b0, "single tile");
-        do_reset; run_tile(8,  1'b1, "pack2 K=8");
+        do_reset; run_tile(16, 1'b1, 1'b0, "pack2 tile");
+        do_reset; run_tile(16, 1'b0, 1'b0, "single tile");
+        do_reset; run_tile(8,  1'b1, 1'b0, "pack2 K=8");
+        do_reset; run_tile(16, 1'b1, 1'b1, "pack2 + hold");
+        do_reset; run_tile(16, 1'b0, 1'b1, "single + hold");
+        do_reset; run_tile(8,  1'b1, 1'b1, "pack2 K=8 + hold");
 
         if (errors == 0) $display("\n== ALL PASS ==");
         else             $display("\n== %0d FAIL ==", errors);

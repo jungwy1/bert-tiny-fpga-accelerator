@@ -14,17 +14,20 @@ module pmpu #(
     input  logic [9:0]   M, N, K,        // output token / feature / hidden dim
     input  logic         pack2,          // 1=INT4 dual(proj/FFN), 0=INT8 single(scores/context)
     input  logic         bias_en,        // proj/FFN=1, scores/context=0
-    input  logic [2:0]   act_sel, w_sel, // operand sources bank ID
+    input  logic [2:0]   act_sel, weight_sel, // operand sources bank ID
     input  logic [12:0]  baseA, baseW, baseB,
     output logic         busy, done,
 
     // -- operand read (-> memory subsystem) --
     output logic [12:0]  act_addr,   output logic [2:0] act_bank,
     input  logic [127:0] act_rdata,
-    output logic [12:0]  w_addr,     output logic [2:0] w_bank,
-    input  logic [127:0] w_rdata,
+    output logic [12:0]  weight_addr,     output logic [2:0] weight_bank,
+    input  logic [127:0] weight_rdata,
     output logic [12:0]  bias_addr,
     input  logic [63:0]  bias_rdata,        // {bias_b, bias_a}
+
+    // -- fifo state
+    input  logic         fifo_full,
 
     // -- result out (-> VFU, 16-lane) --
     output logic         o_valid,
@@ -56,10 +59,10 @@ module pmpu #(
 
     assign busy = (state != S_IDLE);
     assign act_bank = act_sel;
-    assign w_bank   = w_sel;
+    assign weight_bank   = weight_sel;
 
     // --------------------------------- address generation 
-    // w_addr/act_addr: registered accumulators (init per tile, += NT/MT per k) — no multiply.
+    // weight_addr/act_addr: registered accumulators (init per tile, += NT/MT per k) — no multiply.
     // both feature-major (k-major). bias combinational (shift-add).
     assign bias_addr = baseB_r + {tc, 4'b0} + bi;   // baseB + tc*16 + bi
 
@@ -75,7 +78,7 @@ module pmpu #(
     end
 
     // --------------------------------- array 
-    logic signed [7:0]  act_row [16], w_col [16];
+    logic signed [7:0]  act_row [16], weight_col [16];
     logic signed [47:0] bias_col [16];
     logic signed [47:0] p_drain [16];
     logic arr_init, arr_en, arr_drain;
@@ -92,12 +95,12 @@ module pmpu #(
         for (int r = 0; r < 16; r++)
             act_row[r] = feed_v ? $signed(act_rdata[r*8 +: 8]) : 8'sd0;
         for (int c = 0; c < 16; c++)
-            w_col[c]   = feed_v ? $signed(w_rdata[c*8 +: 8])   : 8'sd0;
+            weight_col[c] = feed_v ? $signed(weight_rdata[c*8 +: 8]) : 8'sd0;
     end
 
     pe_array_16x16 u_arr (
         .clk, .rst, .init(arr_init), .en(arr_en), .drain(arr_drain), .pack2(pack2_r),
-        .act_row, .w_col, .bias_col, .p_drain
+        .hold(fifo_full), .act_row, .w_col(weight_col), .bias_col, .p_drain
     );
 
     // --------------------------------- bias packing (preload → C port) 
@@ -129,7 +132,8 @@ module pmpu #(
             state <= S_IDLE; done <= 1'b0; o_valid <= 1'b0;
             tc <= 0; tr <= 0; k_cnt <= 0; bi <= 0; flush_cnt <= 0; beat <= 0;
         end else begin
-            done <= 1'b0; o_valid <= 1'b0;
+            done <= 1'b0; 
+            if (~fifo_full) o_valid <= 1'b0;
 
             unique case (state)
             S_IDLE: if (start) begin
@@ -140,7 +144,7 @@ module pmpu #(
                 state <= bias_en ? S_BIAS : S_COMPUTE;
                 if (!bias_en) begin
                     for (int i = 0; i < 16; i++) bias_col[i] <= 48'sd0;
-                    w_addr <= baseW; act_addr <=baseA;
+                    weight_addr <= baseW; act_addr <=baseA;
                 end
             end
 
@@ -150,15 +154,15 @@ module pmpu #(
                 if (bi >= RD_LAT && bi <= RD_LAT + 15)   // data valid, index 0..15
                     bias_col[bi - RD_LAT] <= b_packed;
                 if (bi == RD_LAT + 15) begin
-                    w_addr <= baseW_r + tc; act_addr <=baseA_r + tr;
+                    weight_addr <= baseW_r + tc; act_addr <=baseA_r + tr;
                     bi <= 0; k_cnt <= 0; state <= S_COMPUTE;
                 end
             end
 
             // stream k: feed operands, accumulate addr (+=NT/MT)
             S_COMPUTE: begin
-                w_addr <= w_addr +NT;
-                act_addr <= act_addr +MT;
+                weight_addr <= weight_addr + NT;
+                act_addr <= act_addr + MT;
                 if (k_cnt < K_r) k_cnt <= k_cnt + 1;
                 else begin flush_cnt <= 0; state <= S_FLUSH; end
             end
@@ -171,26 +175,28 @@ module pmpu #(
 
             // cascade drain -> 16-lane stream (beat0 warmup; pack2 2 beats/col, single 1/col)
             S_DRAIN: begin
-                o_valid <= (beat != 0);
-                acc     <= cur_phase ? acc1 : acc0;
-                o_tr    <= tr;
-                o_feat  <= pack2_r ? ({tc, 5'b0} + {cur_col, 1'b0} + cur_phase)  // tc*32 + 2*col + phase
+                if (~fifo_full) begin
+                    o_valid <= (beat != 0);
+                    acc     <= cur_phase ? acc1 : acc0;
+                    o_tr    <= tr;
+                    o_feat  <= pack2_r ? ({tc, 5'b0} + {cur_col, 1'b0} + cur_phase)  // tc*32 + 2*col + phase
                                    : ({tc, 4'b0} + cur_col);                     // tc*16 + col
-                if (beat == BEATS) state <= S_NEXT;
-                else               beat <= beat + 1;
+                    if (beat == BEATS) state <= S_NEXT;
+                    else               beat <= beat + 1;
+                end
             end
 
             // advance tiles (tc inner, tr outer); bias reloads per tile; re-init addr accum
             S_NEXT: begin
                 if (tc + 1 < NT) begin
                     tc <= tc + 1; bi <= 0; k_cnt <=0;
-                    w_addr <= baseW_r + tc + 1; act_addr <=baseA_r + tr;
+                    weight_addr <= baseW_r + tc + 1; act_addr <=baseA_r + tr;
                     state <= bias_en_r ? S_BIAS : S_COMPUTE;
                 end else begin
                     tc <= 0;
                     if (tr + 1 < MT) begin
                         tr <= tr + 1; bi <= 0; k_cnt <=0;
-                        w_addr <= baseW_r; act_addr <=baseA_r + tr + 1;
+                        weight_addr <= baseW_r; act_addr <=baseA_r + tr + 1;
                         state <= bias_en_r ? S_BIAS : S_COMPUTE;
                     end else begin
                         state <= S_DONE;

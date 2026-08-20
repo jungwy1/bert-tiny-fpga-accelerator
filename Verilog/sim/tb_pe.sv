@@ -1,40 +1,31 @@
 `timescale 1ns/1ps
 // Testbench for pe.sv (DSP48E2 MAC: pack2, in-DSP accumulate, C-port bias, cascade drain).
-//
-// pe outputs the raw 48-bit P via pcout; the TB unpacks it (borrow-corrected) and
-// compares against a golden accumulator that INCLUDES the C-port bias:
-//   pack2=1 : acc0 = bias_a + Sum(w_a*act),  acc1 = bias_b + Sum(w_b*act)
-//   pack2=0 : acc0 = bias   + Sum(w*act),     acc1 = 0
-// Also tests: en=0 gating, and drain (SHIFT: P <- pcin).
-//
-// Timing: init/drain go through OPMODEREG, en through en_latch -> all aligned 1 cyc
-// after presentation. A tile streams K MACs, flushes, then reads pcout.
+
 module tb_pe;
 
-    logic               clk = 0, rst, drain, init, en, pack2;
+    logic               clk = 0, rst, drain, init, en, pack2, hold;
     logic signed [7:0]  act, w;
     logic signed [47:0] bias, pcin, pcout;
 
-    // ---- waveform: unpacked views (auto-dumped via $dumpvars) ----
-    logic signed [3:0]  w_a, w_b;           // pack2 weight nibbles
-    logic signed [31:0] bias_a, bias_b;     // bias fields unpacked from packed C
-    logic signed [31:0] acc0, acc1;         // pcout unpacked (borrow-corrected)
-    // explicit sign-extension to 32b (bit replication) — avoids signed/unsigned mixing
-    // in ternaries which would otherwise zero-extend negatives (e.g. -132 -> 1048444).
+    // ===================================== unpacked signals for debug
+    logic signed [3:0]  w_a, w_b;          
+    logic signed [31:0] bias_a, bias_b;     
+    logic signed [31:0] acc0, acc1;        
+
     assign w_a    = w[3:0];
     assign w_b    = w[7:4];
     assign bias_a = {{12{bias[19]}}, bias[19:0]};
     assign bias_b = {{4{bias[47]}}, bias[47:20]} + {31'b0, bias[19]};
     assign acc0   = pack2 ? {{12{pcout[19]}}, pcout[19:0]} : pcout[31:0];
     assign acc1   = pack2 ? ({{4{pcout[47]}}, pcout[47:20]} + {31'b0, pcout[19]}) : 32'sd0;
+    // =================================================================
 
     int errors = 0;
 
-    pe dut (.clk, .rst, .drain, .init, .en, .pack2, .act, .w, .bias, .pcin, .pcout);
+    pe dut (.clk, .rst, .drain, .init, .en, .hold, .pack2, .act, .w, .bias, .pcin, .pcout);
 
     always #5 clk = ~clk;                       // 100 MHz
 
-    // ------------------------------------------------------------- primitives
     task automatic drive(logic dr, logic it, logic e, logic p2,
                          logic signed [7:0] a, logic signed [7:0] wi,
                          logic signed [47:0] b, logic signed [47:0] pc);
@@ -43,16 +34,13 @@ module tb_pe;
         @(posedge clk); #1;
     endtask
 
-    // hold P (en=0) for readout. en NOT needed here: en_latch (CEP=en delayed 1) lands the
-    // last product (MREG=0 -> mult->P is 1 cyc, exactly the en_latch extension). Verified: PASS.
     task automatic flush(logic p2);
-        drive(0, 0, 0, p2, 0, 0, 48'sd0, 48'sd0);
         drive(0, 0, 0, p2, 0, 0, 48'sd0, 48'sd0);
         drive(0, 0, 0, p2, 0, 0, 48'sd0, 48'sd0);
     endtask
 
     task automatic do_reset;
-        rst = 1; drain = 0; init = 0; en = 0; pack2 = 0;
+        rst = 1; drain = 0; init = 0; en = 0; pack2 = 0; hold = 0;
         act = 0; w = 0; bias = 0; pcin = 0;
         @(posedge clk); @(posedge clk); #1;
         rst = 0;
@@ -119,7 +107,7 @@ module tb_pe;
         e0 = 0; e1 = 0;
         drive(0, 1, 1, 1, 8'sd10, {4'sd2, 4'sd3}, 48'sd0, 48'sd0); e0+=3*10; e1+=2*10;
         drive(0, 0, 1, 1, 8'sd20, {4'sd1, 4'sd2}, 48'sd0, 48'sd0); e0+=2*20; e1+=1*20;
-        drive(0, 0, 0, 1, 8'sd50, {4'sd7, 4'sd7}, 48'sd0, 48'sd0);           // en=0 -> skip
+        drive(0, 0, 0, 1, 8'sd50, {4'sd7, 4'sd7}, 48'sd0, 48'sd0); // en=0 -> skip
         drive(0, 0, 1, 1, 8'sd5,  {4'sd1, 4'sd1}, 48'sd0, 48'sd0); e0+=1*5;  e1+=1*5;
         flush(1);
         check(e0, e1, 1'b1, "hold (en=0 skips)");
@@ -135,6 +123,53 @@ module tb_pe;
         check_raw(V, "drain (P <- pcin)");
     endtask
 
+    // drain + random hold: freezing P mid-shift must be transparent — pcout with hold
+    // cycles removed matches a clean (no-hold) run, and pcout stays frozen through each
+    // hold (the in-flight shift resumes correctly on release).
+    task automatic test_drain_hold;
+        logic signed [47:0] seq [0:11];
+        logic signed [47:0] clean [0:11];
+        logic signed [47:0] frozen;
+        int s, e_before;
+        e_before = errors;
+        for (int i = 0; i < 12; i++) seq[i] = {$random, $random};
+
+        // clean reference: prime P->0, then shift seq, capturing pcout each cycle
+        do_reset; hold = 0;
+        repeat (4) drive(1, 0, 1, 0, 0, 0, 48'sd0, 48'sd0);
+        for (s = 0; s < 12; s++) begin
+            drive(1, 0, 1, 0, 0, 0, 48'sd0, seq[s]);
+            clean[s] = pcout;
+        end
+
+        // held run: same prime + seq, with random hold cycles inserted
+        do_reset; hold = 0;
+        repeat (4) drive(1, 0, 1, 0, 0, 0, 48'sd0, 48'sd0);
+        s = 0;
+        while (s < 12) begin
+            if (s > 0 && ($urandom % 2)) begin              // hold: freeze, garbage pcin
+                frozen = pcout;
+                hold = 1;
+                drive(1, 0, 1, 0, 0, 0, 48'sd0, ~seq[s]);
+                if (pcout !== frozen) begin
+                    errors++;
+                    $display("  [MISS] hold@%0d not frozen: %h != %h", s, pcout, frozen);
+                end
+            end else begin                                  // advance
+                hold = 0;
+                drive(1, 0, 1, 0, 0, 0, 48'sd0, seq[s]);
+                if (pcout !== clean[s]) begin
+                    errors++;
+                    $display("  [MISS] step %0d: %h exp %h", s, pcout, clean[s]);
+                end
+                s++;
+            end
+        end
+        hold = 0;
+        $display("[%s] %-26s mismatches=%0d",
+                 (errors == e_before) ? "PASS" : "FAIL", "drain + random hold", errors - e_before);
+    endtask
+
     // ------------------------------------------------------------------- main
     initial begin
         $dumpfile("tb_pe.vcd");
@@ -147,6 +182,7 @@ module tb_pe;
         do_reset;  run_single(512, "single K=512 (+bias)");
         do_reset;  test_hold;
         do_reset;  test_drain;
+        do_reset;  test_drain_hold;
 
         if (errors == 0) $display("\n== ALL PASS ==");
         else             $display("\n== %0d FAIL ==", errors);

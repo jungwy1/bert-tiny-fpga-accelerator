@@ -10,6 +10,7 @@ module pe (
     input  logic               drain,    // 1: shift P out via PCIN cascade (P <- PCIN)
     input  logic               init,     // 1: tile start, P <- M + bias;  0: P <- P + M
     input  logic               en,       // CEP: gate P update; hold when 0 (must be 1 during drain)
+    input  logic               hold,
     input  logic               pack2,    // 1: INT8xINT4 pack-2 (2 MAC),  0: INT8xINT8 single (1 MAC)
     input  logic signed [7:0]  act,      // INT8 activation
     input  logic signed [7:0]  w,        // pack2=1: {w_b[3:0], w_a[3:0]} two INT4 weights
@@ -40,8 +41,8 @@ module pe (
     // en aligned to the product (1-cycle input-register latency); drives CEP
     logic en_latch;
     always_ff @(posedge clk or posedge rst)
-        if (rst) en_latch <= 1'b0;
-        else     en_latch <= en;
+        if (rst)        en_latch <= 1'b0;
+        else if (~hold) en_latch <= en;
 
     DSP48E2 #(
         .A_INPUT("DIRECT"), .B_INPUT("DIRECT"),
@@ -64,7 +65,7 @@ module pe (
         .ALUMODE(4'b0000),        // Z + X + Y + CIN (add)
         .CARRYINSEL(3'b000), .CARRYIN(1'b0),
         .CEA1(1'b0), .CEA2(1'b1), .CEB1(1'b0), .CEB2(1'b1), .CEC(1'b1),  // CEC: clock C(bias)
-        .CED(1'b1), .CEAD(1'b0), .CEM(1'b0), .CEP(en_latch),   // CEP: en gates P (hold 1 during drain)
+        .CED(1'b1), .CEAD(1'b0), .CEM(1'b0), .CEP(en_latch & (~hold)),   // CEP: en gates P (hold 1 during drain)
         .CEALUMODE(1'b0), .CECARRYIN(1'b0), .CECTRL(1'b1), .CEINMODE(1'b0),  // CECTRL: clock OPMODE reg
         .RSTA(1'b0), .RSTB(1'b0), .RSTC(1'b0), .RSTD(1'b0), .RSTM(1'b0),
         .RSTP(1'b0), .RSTCTRL(1'b0), .RSTINMODE(1'b0), .RSTALUMODE(1'b0),
