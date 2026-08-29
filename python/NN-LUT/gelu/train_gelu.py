@@ -81,17 +81,19 @@ def convert_layer(L, qp, d_u, s_u, t_u):
     s_int = s_u * s_x / s_y
     t_int = t_u / s_y
 
-    # per-segment shamt (6b) + fixed-point slope(18b)/offset(48b)
-    sh    = np.array([pick_shamt(si, ti) for si, ti in zip(s_int, t_int)], dtype=np.int64)
+    # single per-page shamt (6b): largest shift keeping every ACTIVE segment's M in 18b.
+    # dead segments (s=t=0) impose no constraint -> excluded (else they'd force sh=0).
+    per_seg = [pick_shamt(si, ti) for si, ti in zip(s_int, t_int)]
+    sh = min(p for p, si, ti in zip(per_seg, s_int, t_int) if si != 0 or ti != 0)  # single int
     d_fix = np.round(d_int).astype(np.int64)             # int32
-    s_fix = np.array([round(si * (1 << shi)) for si, shi in zip(s_int, sh)], dtype=np.int64)
-    t_fix = np.array([round(ti * (1 << shi)) for ti, shi in zip(t_int, sh)], dtype=np.int64)
+    s_fix = np.round(s_int * (1 << sh)).astype(np.int64)
+    t_fix = np.round(t_int * (1 << sh)).astype(np.int64)
 
     # evaluate the TRUE fixed-point LUT (arith shift = floor) over the valid range
     x   = np.arange(-x_max, x_max + 1, dtype=np.int64)
     idx = np.searchsorted(d_fix, x, side="right")        # 0..15
     raw = s_fix[idx] * x + t_fix[idx]                    # int64: |s|<2^17, |t|<2^47 -> no overflow
-    yq  = raw >> sh[idx]                                  # arithmetic right shift
+    yq  = raw >> sh                                       # single-page arithmetic right shift
     yhat  = np.clip(yq, -CLAMP, CLAMP).astype(np.float64)
     ytrue = np.clip(F.gelu(torch.from_numpy(x.astype(np.float64) * s_x)).numpy() / s_y,
                     -CLAMP, CLAMP)
@@ -120,22 +122,22 @@ def main():
         me, mn = float(r["abs_err"].max()), float(r["abs_err"].mean())
         rms = math.sqrt((r["abs_err"] ** 2).mean())
         print(f"L{r['L']}: x_range=+-{r['x_max']}  S_x={r['s_x']:.4e} S_y={r['s_y']:.4e}  "
-              f"max_err={me:.3f} LSB  mean={mn:.3f}  rms={rms:.3f}  sh={r['sh'].min()}..{r['sh'].max()}")
+              f"max_err={me:.3f} LSB  mean={mn:.3f}  rms={rms:.3f}  shift={r['sh']}")
         assert np.all(np.abs(r["s_fix"]) <= S_MAX), "s_fix overflows 18-bit"
         assert np.all(np.abs(r["t_fix"]) <= T_MAX), "t_fix overflows 48-bit"
-        assert np.all((r["sh"] >= 0) & (r["sh"] <= SH_MAX)), "sh overflows 6-bit"
+        assert 0 <= r["sh"] <= SH_MAX, "shift overflows 6-bit"
         lines.append(f"// ---- L{r['L']} GELU LUT  (S_x={r['s_x']:.6e} S_y={r['s_y']:.6e}, "
-                     f"per-seg shamt)  max_err={me:.3f} LSB")
+                     f"shift={r['sh']})  max_err={me:.3f} LSB")
         lines += [f"d[{i}] = 32'sd{int(v)};" for i, v in enumerate(r["d_fix"])]
         lines += [f"s[{i}] = 18'sd{int(v)};" for i, v in enumerate(r["s_fix"])]
         lines += [f"t[{i}] = 48'sd{int(v)};" for i, v in enumerate(r["t_fix"])]
-        lines += [f"sh[{i}] = 6'd{int(v)};" for i, v in enumerate(r["sh"])]
+        lines.append(f"shift = 6'd{int(r['sh'])};")
         lines.append("")
         report["layers"][f"L{r['L']}"] = {
             "s_x": float(r["s_x"]), "s_y": float(r["s_y"]), "x_max": int(r["x_max"]),
-            "max_err_lsb": me, "mean_err_lsb": mn, "rms_err_lsb": rms,
+            "max_err_lsb": me, "mean_err_lsb": mn, "rms_err_lsb": rms, "shift": int(r["sh"]),
             "d": [int(v) for v in r["d_fix"]], "s": [int(v) for v in r["s_fix"]],
-            "t": [int(v) for v in r["t_fix"]], "sh": [int(v) for v in r["sh"]]}
+            "t": [int(v) for v in r["t_fix"]]}
     with open("lut_gelu.txt", "w") as f:
         f.write("\n".join(lines))
     with open("lut_gelu.json", "w") as f:

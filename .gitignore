@@ -10,7 +10,7 @@ bert-tiny-sst2/
 Verilog/sim/*
 !Verilog/sim/tb_*.sv
 /Verilog/syn/
-
+/Verilog/rtl/ctrl.sv
 
 references/
 BERT_vivado/

@@ -106,12 +106,37 @@ qp["weight"]["L0.W_q"] = {
 ```python
 qp["weight"]["L0.ln1"] = {
     "gamma_int8": Tensor int8,  "gamma_scale": S_g,
-    "beta_int32": Tensor int32, "beta_scale":  S_b,
+    "beta_int32": Tensor int32, "beta_scale":  S_b,        # standalone beta (S_b = max|β|/2^31)
+    "beta_nnlut": Tensor int32, "beta_scale_nnlut": S_g/2^FRAC,  # NN-LUT LN 용 (accumulator 도메인)
     "in": "L0.res1", "out": "L0.ln1_out",
+    "nqs2_int_min": 2502519,    # rsqrt LUT 도메인 (아래 참고). encoder LN 4개만 존재
+    "nqs2_int_max": 16168783,
 }
 ```
 
 이름: `emb_ln`, `L{0,1}.ln{1,2}`.
+
+**`beta_nnlut` / `beta_scale_nnlut` — NN-LUT LayerNorm 용 β.** 정수 LN 은 `out = γ·x̂ + β` 를 `γ_int8 · x_hat_fixed + β` 로 계산하는데, `γ·x̂` 항의 scale 이 `S_g · 2^-FRAC` (x_hat_fixed 는 `x̂·2^FRAC`, `FRAC=22`) 이라 **β 도 같은 accumulator 도메인** 이어야 정수 덧셈이 됨 (matmul bias 가 `S_acc` 도메인인 것과 동일). 그래서 `beta_nnlut = round(β · 2^FRAC / S_g)`, `beta_scale_nnlut = S_g·2^-FRAC`. 기존 `beta_int32`(standalone) 은 그대로 두고 **추가만** 함 (encoder LN 4개, emb_ln 제외).
+
+| LN | \|beta_nnlut\|_max | int32 | beta_scale_nnlut |
+|---|---|---|---|
+| L0.ln1 | 5.90e8 | ✅ | 3.46e-9 |
+| L0.ln2 | 2.20e8 | ✅ | 2.75e-9 |
+| L1.ln1 | 3.73e8 | ✅ | 3.12e-9 |
+| L1.ln2 | 1.78e8 | ✅ | 2.58e-9 |
+
+**`nqs2_int_*` — rsqrt LUT 도메인.** 정수 LayerNorm 은 `x̂ = (Nx − S)/√(NQ − S²)` 로 계산 (N=128, S=Σx, Q=Σx²; 입력 scale 은 분자·분모에서 상쇄됨). 분모의 `1/√(NQ−S²)` 을 rsqrt NN-LUT 로 근사하는데, 그 **입력 `den = NQ − S²`(정수) 의 관측 범위**가 이 두 값. **den 은 float `res` 를 나눈 게 아니라, HW 가 만드는 int8 residual (`round(res_real/S_res)`) 위에서 직접 누산** — int8 반올림이 저분산 행의 den 을 바꾸기 때문. calibration 512문장에서 per-row `den>0` 관측한 min/max:
+
+| LN | nqs2_int_min | nqs2_int_max | max/min |
+|---|---|---|---|
+| L0.ln1 | 2,502,519 | 16,168,783 | 6.5× |
+| L0.ln2 | 399,159 | 3,250,972 | 8.1× |
+| L1.ln1 | 1,382,640 | 12,744,527 | 9.2× |
+| L1.ln2 | 8,164,732 | 20,896,240 | 2.6× |
+
+- `emb_ln` 은 PS(host) 담당이라 `nqs2_*` 없음 (encoder LN 4개만).
+- `den = 0` (전 feature 동일) 행은 HW 에서 가드(→ x̂=0), 도메인 밖.
+- 전체 union `[4e5, 2.1e7]` ≈ 52× (recip 64× 보다 좁음 → rsqrt fit 용이).
 
 ### (c) embedding table (INT8, PS 담당) — 3개
 
@@ -176,11 +201,33 @@ ctx_int = (acc * ((1/127)*S_v / S_ctx)).round()...     # -> L{i}.ctx scale
 
 ### 4.4 LayerNorm
 
+`x̂ = (x − μ)/σ` 를 정수 누산 2개(S=Σx, Q=Σx²)로 재구성. **입력 scale 이 상쇄**되어 정수 x 만으로 계산됨:
+
+```
+μ = S/N,   σ² = (NQ − S²)/N²
+x̂ = (x − μ)/σ = (Nx − S) / √(NQ − S²)          # N=128, 입력 scale 무관
+out = γ·x̂ + β
+```
+
 ```python
 ln = qp["weight"]["L0.ln1"]
-# gamma * normalized + beta.  gamma_int8(S_g), beta_int32(S_b) 를 정수 datapath 에 fold.
-# 자세한 정수 LN 수식은 I-BERT / SwiftTron 참고 (mean/var 는 wide 정수).
+# 1) 정수 누산 (per row, N=128 feature):
+S = x_int8.sum(-1); Q = (x_int8.int()**2).sum(-1)     # S ~15b, Q ~21b
+num = 128*x_int8 - S                                  # 분자 (정수)
+den = 128*Q - S**2                                    # 분모 = NQ-S^2  ->  nqs2_int_min..max
+# 2) 1/sqrt(den) 을 rsqrt NN-LUT 로 (den 도메인 = nqs2_int_min/max):
+rsqrt = rsqrt_lut(den)                                # ~ (1/√den)·2^FRAC, per row 배수
+x_hat_fixed = num * rsqrt                             # x̂·2^FRAC  (FRAC=22; x̂ 단위분산, |x̂|≤√127)
+# 3) γ·x̂ + β 를 accumulator 도메인(S_g·2^-FRAC)에서 합친 뒤 출력 int8(S_out)로 단일 requant:
+acc = gamma_int8 * x_hat_fixed + beta_nnlut           # scale S_g·2^-FRAC, 정수 덧셈
+out = (acc * M).round().clamp(-127,127)               # M = S_g·2^-FRAC / S_out
 ```
+
+- **입력 scale 상쇄**: `μ, σ` 둘 다 S_in 배라 `x̂` 는 순수 정수 누산으로 나옴 (calibration 불필요).
+- **x̂ 스케일 = 2^-FRAC** (`FRAC=22`; 단위분산이라 range 고정 `|x̂| ≤ √(N−1) ≈ 11.27`). `x_hat_fixed` 는 27b signed → int32.
+- **rsqrt LUT**: 입력 `den = NQ−S²` (정수), 도메인 = `nqs2_int_min/max` (LN 별). recip 과 동일 구조(log-spaced analytic, 출력=배수 M) 로 `1/√den` 근사.
+- **β 는 accumulator 도메인**: `γ·x̂` 이 `S_g·2^-FRAC` 스케일이라 β 도 같은 스케일(`beta_nnlut`) 로 두면 정수 덧셈 + **requant 배수 M 하나**. (matmul bias 가 `S_acc` 도메인인 것과 동일. 기존 standalone `beta_int32` 는 쓰지 않음.)
+- **출력 requant**: `M = S_g·2^-FRAC / S_out` (`S_out` = `out` activation scale). `den=0` 행은 x̂=0 가드.
 
 ### 4.5 비선형 (softmax / gelu / tanh) — NN-LUT
 
