@@ -15,15 +15,15 @@ module pmpu #(
     input  logic         pack2,          // 1=INT4 dual(proj/FFN), 0=INT8 single(scores/context)
     input  logic         bias_en,        // proj/FFN=1, scores/context=0
     input  logic [2:0]   act_sel, weight_sel, // operand sources bank ID
-    input  logic [12:0]  baseA, baseW, baseB,
+    input  logic [15:0]  baseA, baseW, baseB,
     output logic         busy, done,
 
     // -- operand read (-> memory subsystem) --
-    output logic [12:0]  act_addr,   output logic [2:0] act_bank,
+    output logic [15:0]  act_addr,   output logic [2:0] act_bank,
     input  logic [127:0] act_rdata,
-    output logic [12:0]  weight_addr,     output logic [2:0] weight_bank,
+    output logic [15:0]  weight_addr,     output logic [2:0] weight_bank,
     input  logic [127:0] weight_rdata,
-    output logic [12:0]  bias_addr,
+    output logic [15:0]  bias_addr,
     input  logic [63:0]  bias_rdata,        // {bias_b, bias_a}
 
     // -- fifo state
@@ -39,7 +39,7 @@ module pmpu #(
     // ----------------------------------- command latch 
     logic [9:0]  M_r, N_r, K_r;
     logic        pack2_r, bias_en_r;
-    logic [12:0] baseA_r, baseW_r, baseB_r;
+    logic [15:0] baseA_r, baseW_r, baseB_r;
 
     // tile counts (assume dims divisible: M/16, N/32(pack2) or N/16)
     wire [3:0] MT = M_r[9:4];                          // M/16

@@ -1,22 +1,19 @@
 `timescale 1ns/1ps
-// On-chip memory subsystem: all banks + operand mux + address routing + write decode.
-//   Presents pmpu's operand-read interface (act/weight/bias) and hides the physical banks:
-//     5× mem_act (resid,b0..b3) · 3× mem_weight URAM (QKVO,FFN0,FFN1) · mem_bias · mem_ln_param
-//   Datapath ports are dedicated (no arbiter, §7): each bank read by <=1 operand at a time.
-//   PS(host) touches only the residual bank, and only while idle (busy-mux).
 module mem_subsys (
     input  logic         clk,
     input  logic         busy,                          // 1: datapath owns resid; 0: PS may access
-    // -- pmpu operand read --
-    input  logic [2:0]   act_sel,    input logic [12:0] act_addr,    output logic [127:0] act_rdata,
-    input  logic [2:0]   weight_sel, input logic [12:0] weight_addr, output logic [127:0] weight_rdata,
-    input  logic [12:0]  bias_addr,  output logic [63:0] bias_rdata,
+    // -- pmpu operand read --  
+    input  logic [2:0]   act_sel,    input logic [15:0] act_addr,    output logic [127:0] act_rdata,
+    input  logic [2:0]   weight_sel, input logic [15:0] weight_addr, output logic [127:0] weight_rdata,
+    input  logic [15:0]  bias_addr,  output logic [63:0] bias_rdata,
     // -- VFU drain write (result -> act banks) --
-    input  logic [2:0]   dest_sel,   input logic we, input logic [12:0] waddr, input logic [127:0] wdata,
+    input  logic [2:0]   dest_sel,   input logic we, input logic [15:0] waddr, input logic [127:0] wdata,
     // -- VFU ln_param read --
-    input  logic         ln_re,      input logic [8:0] ln_addr,      output logic [71:0] ln_rdata,
+    input  logic         ln_re,      input logic [15:0] ln_addr,      output logic [71:0] ln_rdata,
+    // -- VFU residual read --
+    input  logic         vfu_res_re, input logic [15:0] vfu_res_addr, output logic [127:0] vfu_res_rdata,
     // -- PS(host) load/readback (residual only) --
-    input  logic         ps_we, ps_re, input logic [8:0] ps_addr,
+    input  logic         ps_we, ps_re, input logic [15:0] ps_addr,
     input  logic [127:0] ps_wdata,   output logic [127:0] ps_rdata
 );
 
@@ -28,10 +25,13 @@ module mem_subsys (
     logic [127:0] rd_qkvo, rd_ffn0, rd_ffn1;
 
     // ---- read address routing (each bank read by <=1 operand at a time) ----
-    wire [8:0] a_act = act_addr[8:0];                    // H-mode: local = addr[8:0], bank = addr[10:9]
+    wire [8:0] a_act = act_addr[8:0]; // H-mode: local = addr[8:0], bank = addr[10:9]
     wire [8:0] a_wgt = weight_addr[8:0];
     wire [1:0] a_hbank = act_addr[10:9];                 // H sub-bank select (FFN2 read)
-    wire [8:0] resid_ra = busy ? a_act : ps_addr;        // PS reads resid only while idle
+    // resid read: idle->PS,  LN op->VFU skip fetch,  else pmpu-act
+    wire [8:0] resid_ra = ~busy      ? ps_addr[8:0]
+                        : vfu_res_re ? vfu_res_addr[8:0]
+                        :              a_act;
     // b0/b3: act only (direct or H) -> always act_addr.  b1/b2: weight (K/V) unless H picks them.
     wire [8:0] b1_ra = (act_sel == A_H && a_hbank == 2'd1) ? a_act : a_wgt;
     wire [8:0] b2_ra = (act_sel == A_H && a_hbank == 2'd2) ? a_act : a_wgt;
@@ -41,7 +41,7 @@ module mem_subsys (
     wire [8:0] vfu_wa = waddr[8:0];
     wire [1:0] w_hbank = waddr[10:9];
     wire         resid_we = busy ? (we & (dest_sel == A_RESID)) : ps_we;
-    wire [8:0]   resid_wa = busy ? vfu_wa : ps_addr;
+    wire [8:0]   resid_wa = busy ? vfu_wa : ps_addr[8:0];
     wire [127:0] resid_wd = busy ? wdata  : ps_wdata;
     wire b0_we = we & ((dest_sel == A_B0) | (dest_sel == A_H && w_hbank == 2'd0));
     wire b1_we = we & ((dest_sel == A_B1) | (dest_sel == A_H && w_hbank == 2'd1));
@@ -74,7 +74,7 @@ module mem_subsys (
 
     // ---- ln_param BRAM (512 x 72, baked) ----
     mem_ln_param #(.INIT_FILE("mem/ln_param.txt")) u_ln (.clk, .we(1'b0), .waddr('0), .wdata('0),
-                     .re(ln_re), .raddr(ln_addr), .rdata(ln_rdata));
+                     .re(ln_re), .raddr(ln_addr[8:0]), .rdata(ln_rdata));
 
     // ---- read-data mux (select delayed 1 cyc to align with RD_LAT=1 registered read) ----
     logic [2:0] asel_q, wsel_q;
@@ -110,6 +110,7 @@ module mem_subsys (
         endcase
     end
 
-    assign ps_rdata = rd_resid;                          // PS reads residual only
+    assign ps_rdata      = rd_resid;                     // PS reads residual only
+    assign vfu_res_rdata = rd_resid;                     // VFU skip fetch (Res+Norm)
 
 endmodule

@@ -157,9 +157,7 @@ class EncoderLayer(nn.Module):
         self.rq_k = req_ms(L, "k")
         self.rq_v = req_ms(L, "v")
         self.rq_ln1_in  = req_ms(L, "ln1_in")
-        self.rq_ln1_out = req_ms(L, "ln1_out")
         self.rq_ln2_in  = req_ms(L, "ln2_in")
-        self.rq_ln2_out = req_ms(L, "ln2_out")
         # attention
         self.Wq = qp["weight"][f"L{L}.W_q"]["w_int4"].T; self.bq = qp["weight"][f"L{L}.W_q"]["bias_int32"]
         self.Wk = qp["weight"][f"L{L}.W_k"]["w_int4"].T; self.bk = qp["weight"][f"L{L}.W_k"]["bias_int32"]
